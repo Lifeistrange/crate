@@ -43,11 +43,9 @@ import io.crate.planner.projection.FetchProjection;
 import io.crate.planner.projection.FilterProjection;
 import io.crate.planner.projection.Projection;
 import io.crate.planner.projection.TopNProjection;
-import io.crate.planner.projection.builder.InputColumns;
 import io.crate.planner.projection.builder.ProjectionBuilder;
 
 import javax.annotation.Nullable;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -108,8 +106,21 @@ public class QueryAndFetchConsumer implements Consumer {
             if (qs.hasAggregates() || qs.groupBy().isPresent()) {
                 return null;
             }
+
+            /*
+             * select * from (                                                      // parent relation
+             *      select x, y, z from (                                           // relation
+             *           select x, y, z from t order by x desc limit 100            // relation.subRelation
+             *      ) tt
+             *      where
+             *      tt.x = 10
+             *      order by tt.x asc limit 50
+             * ) ttt
+             * order by ttt.x desc limit 10
+             */
             Planner.Context plannerContext = context.plannerContext();
-            context.setFetchDecider(new FetchDecider.Static(false));
+            FetchDecider parentFetchDecider = context.fetchDecider();
+            context.setFetchDecider(FetchDecider.NO_FINALIZE);
             QueriedRelation subRelation = relation.subRelation();
             Plan subPlan = plannerContext.planSubRelation(subRelation, context);
 
@@ -130,17 +141,10 @@ public class QueryAndFetchConsumer implements Consumer {
                      *                       |
                      *                      postFetchOutputs
                      */
-                    boolean[] eagerFilterPossible = new boolean[] { true };
-                    FieldsVisitor.visitFields(where.query(), f -> {
-                        Symbol symbol = fetchDescription.postFetchOutputs().get(f.index());
-                        if (fetchDescription.isFetched(symbol)) {
-                            eagerFilterPossible[0] = false;
-                        }
-                    });
-                    if (eagerFilterPossible[0]) {
-                        Symbol query = FieldReplacer.replaceFields(where.query(), f -> fetchDescription.postFetchOutputs().get(f.index()));
+                    Symbol queryWithInputCols = fetchDescription.tryCreateInputColumns(where.query());
+                    if (queryWithInputCols != null) {
                         FilterProjection filterProjection = new FilterProjection(
-                            InputColumns.create(query, fetchDescription.preFetchOutputs()),
+                            queryWithInputCols,
                             InputColumn.fromSymbols(fetchDescription.preFetchOutputs()));
                         subPlan.addProjection(filterProjection, null, null, null);
                         where = WhereClause.MATCH_ALL;
@@ -149,8 +153,6 @@ public class QueryAndFetchConsumer implements Consumer {
 
                 OrderBy orderBy = qs.orderBy().orElse(null);
                 if (orderBy != null) {
-                    // FIXME: need to replace fields in orderBySymbols with pointer to preFetchOutput
-                    // subRelation fields describe postFetch
                     boolean[] eagerOrderByPossible = new boolean[] { true };
                     FieldsVisitor.visitFields(orderBy.orderBySymbols(), f -> {
                         Symbol symbol = fetchDescription.postFetchOutputs().get(f.index());
@@ -170,6 +172,14 @@ public class QueryAndFetchConsumer implements Consumer {
                         );
                         subPlan.addProjection(topNOrEval, null, null, null);
                     }
+                }
+
+                if (limitAndOrderByApplied
+                    && where == WhereClause.MATCH_ALL
+                    && parentFetchDecider.tryFetchRewrite()
+                    && !parentFetchDecider.finalizeFetch()) {
+
+                    return new PendingFetch(subPlan, fetchDescription);
                 }
                 subPlan = planFetch(fetchDescription, plannerContext, subPlan);
             }
@@ -216,19 +226,6 @@ public class QueryAndFetchConsumer implements Consumer {
         );
         subPlan.addProjection(fetchProjection, null, null, null);
         return new QueryThenFetch(subPlan, fetchPhase);
-    }
-
-    private static List<Symbol> extractQuerySymbols(QuerySpec qs) {
-        Optional<OrderBy> orderBy = qs.orderBy();
-        List<Symbol> querySymbols = new ArrayList<>();
-        if (orderBy.isPresent()) {
-            querySymbols.addAll(orderBy.get().orderBySymbols());
-        }
-        WhereClause where = qs.where();
-        if (where.hasQuery()) {
-            querySymbols.add(where.query());
-        }
-        return querySymbols;
     }
 
     private static void maybeAddFilterProjection(WhereClause whereClause, List<? extends Symbol> subRelationOutputs, Plan plan) {

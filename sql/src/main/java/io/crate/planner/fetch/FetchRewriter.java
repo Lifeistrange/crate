@@ -26,10 +26,7 @@ import com.google.common.collect.ImmutableSet;
 import io.crate.analyze.OrderBy;
 import io.crate.analyze.QuerySpec;
 import io.crate.analyze.relations.QueriedDocTable;
-import io.crate.analyze.symbol.FetchReference;
-import io.crate.analyze.symbol.InputColumn;
-import io.crate.analyze.symbol.ReferenceReplacer;
-import io.crate.analyze.symbol.Symbol;
+import io.crate.analyze.symbol.*;
 import io.crate.collections.Lists2;
 import io.crate.metadata.DocReferences;
 import io.crate.metadata.Reference;
@@ -37,7 +34,9 @@ import io.crate.metadata.RowGranularity;
 import io.crate.metadata.TableIdent;
 import io.crate.metadata.doc.DocSysColumns;
 import io.crate.metadata.doc.DocTableInfo;
+import io.crate.planner.projection.builder.InputColumns;
 
+import javax.annotation.Nullable;
 import java.util.*;
 import java.util.function.Function;
 
@@ -108,6 +107,22 @@ public final class FetchRewriter {
 
         public boolean isFetched(Symbol symbol) {
             return symbol instanceof Reference && fetchRefs.contains(symbol);
+        }
+
+        @Nullable
+        public Symbol tryCreateInputColumns(Symbol symbolTree) {
+            boolean[] preFetchAvailable = new boolean[] { false };
+            FieldsVisitor.visitFields(symbolTree, f -> {
+                Symbol symbol = postFetchOutputs.get(f.index());
+                if (symbol instanceof Reference && fetchRefs.contains(symbol)) {
+                    preFetchAvailable[0] = true;
+                }
+            });
+            if (preFetchAvailable[0]) {
+                Symbol replacedSymbolTree = FieldReplacer.replaceFields(symbolTree, f -> postFetchOutputs.get(f.index()));
+                return InputColumns.create(replacedSymbolTree, preFetchOutputs);
+            }
+            return null;
         }
     }
 
