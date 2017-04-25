@@ -29,6 +29,7 @@ import io.crate.data.*;
 import io.crate.executor.transport.TransportActionProvider;
 import io.crate.metadata.*;
 import io.crate.operation.InputFactory;
+import io.crate.operation.NodeJobsTracker;
 import io.crate.operation.aggregation.impl.AverageAggregation;
 import io.crate.operation.aggregation.impl.CountAggregation;
 import io.crate.operation.operator.EqOperator;
@@ -80,6 +81,7 @@ public class ProjectionToProjectorVisitorTest extends CrateUnitTest {
         threadPool = new TestThreadPool("testing");
         visitor = new ProjectionToProjectorVisitor(
             mock(ClusterService.class),
+            mock(NodeJobsTracker.class),
             functions,
             new IndexNameExpressionResolver(Settings.EMPTY),
             threadPool,

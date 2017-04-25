@@ -30,6 +30,7 @@ import io.crate.data.Row;
 import io.crate.data.Row1;
 import io.crate.executor.transport.ShardRequest;
 import io.crate.executor.transport.ShardResponse;
+import io.crate.operation.NodeJobsTracker;
 import io.crate.operation.collect.CollectExpression;
 import io.crate.operation.collect.RowShardResolver;
 import io.crate.settings.CrateSetting;
@@ -40,6 +41,8 @@ import org.elasticsearch.action.admin.indices.create.BulkCreateIndicesResponse;
 import org.elasticsearch.action.admin.indices.create.TransportBulkCreateIndicesAction;
 import org.elasticsearch.action.bulk.BackoffPolicy;
 import org.elasticsearch.action.bulk.BulkRequestExecutor;
+import org.elasticsearch.cluster.routing.ShardIterator;
+import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.unit.TimeValue;
@@ -47,7 +50,14 @@ import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.index.shard.ShardId;
 
 import javax.annotation.Nullable;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -81,10 +91,12 @@ public class ShardingShardRequestAccumulator<TReq extends ShardRequest<TReq, TIt
     private final Map<ShardId, TReq> requestsByShard = new HashMap<>();
     private final Map<String, List<PendingRequest<TItem>>> pendingRequestsByIndex = new HashMap<>();
     private final BitSet responses = new BitSet();
+    private final NodeJobsTracker nodeJobsTracker;
 
     private int location = -1;
 
     public ShardingShardRequestAccumulator(ClusterService clusterService,
+                                           NodeJobsTracker nodeJobsTracker,
                                            ScheduledExecutorService scheduler,
                                            int bulkSize,
                                            int createIndicesBulkSize,
@@ -98,6 +110,7 @@ public class ShardingShardRequestAccumulator<TReq extends ShardRequest<TReq, TIt
                                            BulkRequestExecutor<TReq> requestExecutor,
                                            TransportBulkCreateIndicesAction createIndicesAction) {
         this.clusterService = clusterService;
+        this.nodeJobsTracker = nodeJobsTracker;
         this.scheduler = scheduler;
         this.bulkSize = bulkSize;
         this.createIndicesBulkSize = createIndicesBulkSize;
@@ -196,25 +209,11 @@ public class ShardingShardRequestAccumulator<TReq extends ShardRequest<TReq, TIt
             TReq request = entry.getValue();
             it.remove();
 
-            ActionListener<ShardResponse> listener = new ActionListener<ShardResponse>() {
+            ShardId shardId = entry.getKey();
+            String nodeId = getDestinationNodeId(request, shardId);
+            nodeJobsTracker.registerJob(nodeId, jobId);
 
-                @Override
-                public void onResponse(ShardResponse shardResponse) {
-                    processShardResponse(shardResponse);
-                    countdown();
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    countdown();
-                }
-
-                private void countdown() {
-                    if (numRequests.decrementAndGet() == 0) {
-                        result.complete(responses);
-                    }
-                }
-            };
+            ActionListener<ShardResponse> listener = new ShardResponseActionListener(nodeId, numRequests, result);
             listener = new RetryListener<>(
                 scheduler,
                 l -> requestExecutor.execute(request, l),
@@ -224,6 +223,25 @@ public class ShardingShardRequestAccumulator<TReq extends ShardRequest<TReq, TIt
             requestExecutor.execute(request, listener);
         }
         return result;
+    }
+
+    @Nullable
+    private String getDestinationNodeId(TReq request, ShardId shardId) {
+        ShardIterator shardIterator = clusterService.operationRouting().indexShards(clusterService.state(),
+            shardId.getIndexName(),
+            String.valueOf(shardId.getId()), request.routing());
+        String nodeId = null;
+        if (shardIterator != null) {
+            ShardRouting shardRouting;
+            while ((shardRouting = shardIterator.nextOrNull()) != null) {
+                if (!shardRouting.active()) {
+                    continue;
+                }
+                nodeId = shardRouting.currentNodeId();
+                break;
+            }
+        }
+        return nodeId;
     }
 
     private void processShardResponse(ShardResponse shardResponse) {
@@ -301,6 +319,38 @@ public class ShardingShardRequestAccumulator<TReq extends ShardRequest<TReq, TIt
         PendingRequest(TItem item, String routing) {
             this.item = item;
             this.routing = routing;
+        }
+    }
+
+    private class ShardResponseActionListener implements ActionListener<ShardResponse> {
+
+        private final String destinationNode;
+        private final AtomicInteger numRequests;
+        private final CompletableFuture<BitSet> result;
+
+        public ShardResponseActionListener(String destinationNode, AtomicInteger numRequests, CompletableFuture<BitSet> result) {
+            this.destinationNode = destinationNode;
+            this.numRequests = numRequests;
+            this.result = result;
+        }
+
+        @Override
+        public void onResponse(ShardResponse shardResponse) {
+            nodeJobsTracker.unregisterJobFromNode(destinationNode, jobId);
+            processShardResponse(shardResponse);
+            countdown();
+        }
+
+        @Override
+        public void onFailure(Exception e) {
+            nodeJobsTracker.unregisterJobFromNode(destinationNode, jobId);
+            countdown();
+        }
+
+        private void countdown() {
+            if (numRequests.decrementAndGet() == 0) {
+                result.complete(responses);
+            }
         }
     }
 }
