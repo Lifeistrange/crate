@@ -34,7 +34,9 @@ import io.crate.collections.Lists2;
 import io.crate.metadata.DocReferences;
 import io.crate.metadata.Reference;
 import io.crate.metadata.RowGranularity;
+import io.crate.metadata.TableIdent;
 import io.crate.metadata.doc.DocSysColumns;
+import io.crate.metadata.doc.DocTableInfo;
 
 import java.util.*;
 import java.util.function.Function;
@@ -56,13 +58,28 @@ public final class FetchRewriter {
 
     public final static class FetchDescription {
 
+        private final TableIdent tableIdent;
+        private final List<Reference> partitionedByColumns;
         private final List<Symbol> preFetchOutputs;
+
+        /**
+         * Symbols describing the outputs after the fetch.
+         *
+         * These are the columns from the selectList/querySpec#outputs but may have been modified
+         * (For example to do a source lookup)
+         *
+         * The order of the column matches the order they had in the selectList/querySpec
+         */
         private final List<Symbol> postFetchOutputs;
         private final Collection<Reference> fetchRefs;
 
-        private FetchDescription(List<Symbol> preFetchOutputs,
+        private FetchDescription(TableIdent tableIdent,
+                                 List<Reference> partitionedByColumns,
+                                 List<Symbol> preFetchOutputs,
                                  List<Symbol> postFetchOutputs,
                                  Collection<Reference> fetchRefs) {
+            this.tableIdent = tableIdent;
+            this.partitionedByColumns = partitionedByColumns;
             this.preFetchOutputs = preFetchOutputs;
             this.postFetchOutputs = postFetchOutputs;
             this.fetchRefs = fetchRefs;
@@ -70,6 +87,27 @@ public final class FetchRewriter {
 
         public Collection<Reference> fetchRefs() {
             return fetchRefs;
+        }
+
+        // TODO: this could probably be removed, it can be inferred from the pre-/postFetchOutputs
+        public List<Reference> partitionedByColumns() {
+            return partitionedByColumns;
+        }
+
+        public TableIdent tableIdent() {
+            return tableIdent;
+        }
+
+        public List<Symbol> postFetchOutputs() {
+            return postFetchOutputs;
+        }
+
+        public List<Symbol> preFetchOutputs() {
+            return preFetchOutputs;
+        }
+
+        public boolean isFetched(Symbol symbol) {
+            return symbol instanceof Reference && fetchRefs.contains(symbol);
         }
     }
 
@@ -114,7 +152,9 @@ public final class FetchRewriter {
                 return ReferenceReplacer.replaceRefs(s, maybeConvertToSourceLookupAndSaveRefs);
             });
 
-        Reference fetchId = DocSysColumns.forTable(query.tableRelation().tableInfo().ident(), DocSysColumns.FETCHID);
+        DocTableInfo tableInfo = query.tableRelation().tableInfo();
+        TableIdent tableIdent = tableInfo.ident();
+        Reference fetchId = DocSysColumns.forTable(tableIdent, DocSysColumns.FETCHID);
         ArrayList<Symbol> preFetchOutputs = new ArrayList<>(1 + querySymbols.size());
         preFetchOutputs.add(fetchId);
         preFetchOutputs.addAll(querySymbols);
@@ -122,6 +162,7 @@ public final class FetchRewriter {
             preFetchOutputs.add(scoreColumn[0]);
         }
         querySpec.outputs(preFetchOutputs);
-        return new FetchDescription(preFetchOutputs, postFetchOutputs, fetchRefs);
+        return new FetchDescription(
+            tableIdent, tableInfo.partitionedByColumns(), preFetchOutputs, postFetchOutputs, fetchRefs);
     }
 }

@@ -25,14 +25,11 @@ import com.google.common.collect.ImmutableMap;
 import io.crate.analyze.*;
 import io.crate.analyze.relations.AnalyzedRelation;
 import io.crate.analyze.relations.QueriedDocTable;
-import io.crate.analyze.symbol.Function;
-import io.crate.analyze.symbol.InputColumn;
-import io.crate.analyze.symbol.Symbol;
-import io.crate.analyze.symbol.SymbolVisitor;
+import io.crate.analyze.relations.QueriedRelation;
+import io.crate.analyze.symbol.*;
 import io.crate.collections.Lists2;
 import io.crate.exceptions.UnsupportedFeatureException;
 import io.crate.exceptions.VersionInvalidException;
-import io.crate.metadata.doc.DocTableInfo;
 import io.crate.operation.predicate.MatchPredicate;
 import io.crate.planner.*;
 import io.crate.planner.fetch.FetchRewriter;
@@ -46,9 +43,11 @@ import io.crate.planner.projection.FetchProjection;
 import io.crate.planner.projection.FilterProjection;
 import io.crate.planner.projection.Projection;
 import io.crate.planner.projection.TopNProjection;
+import io.crate.planner.projection.builder.InputColumns;
 import io.crate.planner.projection.builder.ProjectionBuilder;
 
 import javax.annotation.Nullable;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -86,33 +85,7 @@ public class QueryAndFetchConsumer implements Consumer {
             Plan subPlan = normalSelect(table, context);
             if (context.fetchDecider().finalizeFetch()) {
                 subPlan = Merge.ensureOnHandler(subPlan, plannerContext);
-
-                ReaderAllocations readerAllocations = plannerContext.buildReaderAllocations();
-                FetchPhase fetchPhase = new FetchPhase(
-                    plannerContext.nextExecutionPhaseId(),
-                    readerAllocations.nodeReaders().keySet(),
-                    readerAllocations.bases(),
-                    readerAllocations.tableIndices(),
-                    fetchDescription.fetchRefs()
-                );
-                DocTableInfo docTableInfo = table.tableRelation().tableInfo();
-                InputColumn fetchId = new InputColumn(0);
-                FetchSource fetchSource = new FetchSource(
-                    docTableInfo.partitionedByColumns(),
-                    Collections.singletonList(fetchId),
-                    fetchDescription.fetchRefs()
-                );
-                FetchProjection fetchProjection = new FetchProjection(
-                    fetchPhase.phaseId(),
-                    plannerContext.fetchSize(),
-                    ImmutableMap.of(docTableInfo.ident(), fetchSource),
-                    FetchRewriter.generateFetchOutputs(fetchDescription),
-                    readerAllocations.nodeReaders(),
-                    readerAllocations.indices(),
-                    readerAllocations.indicesToIdents()
-                );
-                subPlan.addProjection(fetchProjection, null, null, null);
-                return new QueryThenFetch(subPlan, fetchPhase);
+                return planFetch(fetchDescription, plannerContext, subPlan);
             }
             return new PendingFetch(subPlan, fetchDescription);
         }
@@ -136,27 +109,131 @@ public class QueryAndFetchConsumer implements Consumer {
                 return null;
             }
             Planner.Context plannerContext = context.plannerContext();
-            Plan plan = Merge.ensureOnHandler(
-                plannerContext.planSubRelation(relation.subRelation(), context), plannerContext);
+            context.setFetchDecider(new FetchDecider.Static(false));
+            QueriedRelation subRelation = relation.subRelation();
+            Plan subPlan = plannerContext.planSubRelation(subRelation, context);
 
+            FetchRewriter.FetchDescription fetchDescription = subPlan.resultDescription().fetchDescription();
+            subPlan = Merge.ensureOnHandler(subPlan, plannerContext);
+            WhereClause where = qs.where();
             Limits limits = plannerContext.getLimits(qs);
-            maybeAddFilterProjection(relation, plan);
-            Projection topN = ProjectionBuilder.topNOrEval(
-                relation.subRelation().fields(),
-                qs.orderBy().orElse(null),
-                limits.offset(),
-                limits.finalLimit(),
-                qs.outputs()
-            );
-            plan.addProjection(topN, null, null, null);
-            return plan;
+            boolean limitAndOrderByApplied = false;
+
+            if (fetchDescription != null) {
+                if (where.noMatch()) {
+                    subPlan.addProjection(ProjectionBuilder.filterProjection(subRelation.fields(), where), null, null, null);
+                    where = WhereClause.MATCH_ALL;
+                }
+                if (where.hasQuery()) {
+                    /* select * from (select y, x from t order by x limit 10) tt where x + x = 2
+                     *                       ~~~~                                      ~~~~~~~~~
+                     *                       |
+                     *                      postFetchOutputs
+                     */
+                    boolean[] eagerFilterPossible = new boolean[] { true };
+                    FieldsVisitor.visitFields(where.query(), f -> {
+                        Symbol symbol = fetchDescription.postFetchOutputs().get(f.index());
+                        if (fetchDescription.isFetched(symbol)) {
+                            eagerFilterPossible[0] = false;
+                        }
+                    });
+                    if (eagerFilterPossible[0]) {
+                        Symbol query = FieldReplacer.replaceFields(where.query(), f -> fetchDescription.postFetchOutputs().get(f.index()));
+                        FilterProjection filterProjection = new FilterProjection(
+                            InputColumns.create(query, fetchDescription.preFetchOutputs()),
+                            InputColumn.fromSymbols(fetchDescription.preFetchOutputs()));
+                        subPlan.addProjection(filterProjection, null, null, null);
+                        where = WhereClause.MATCH_ALL;
+                    }
+                }
+
+                OrderBy orderBy = qs.orderBy().orElse(null);
+                if (orderBy != null) {
+                    // FIXME: need to replace fields in orderBySymbols with pointer to preFetchOutput
+                    // subRelation fields describe postFetch
+                    boolean[] eagerOrderByPossible = new boolean[] { true };
+                    FieldsVisitor.visitFields(orderBy.orderBySymbols(), f -> {
+                        Symbol symbol = fetchDescription.postFetchOutputs().get(f.index());
+                        if (fetchDescription.isFetched(symbol)) {
+                            eagerOrderByPossible[0] = false;
+                        }
+                    });
+                    if (eagerOrderByPossible[0]) {
+                        limitAndOrderByApplied = true;
+                        orderBy.replace(s -> FieldReplacer.replaceFields(s, f -> fetchDescription.postFetchOutputs().get(f.index())));
+                        Projection topNOrEval = ProjectionBuilder.topNOrEval(
+                            fetchDescription.preFetchOutputs(),
+                            orderBy,
+                            limits.offset(),
+                            limits.finalLimit(),
+                            fetchDescription.preFetchOutputs()
+                        );
+                        subPlan.addProjection(topNOrEval, null, null, null);
+                    }
+                }
+                subPlan = planFetch(fetchDescription, plannerContext, subPlan);
+            }
+
+            maybeAddFilterProjection(where, subRelation.fields(), subPlan);
+            if (!limitAndOrderByApplied) {
+                Projection topN = ProjectionBuilder.topNOrEval(
+                    subRelation.fields(),
+                    qs.orderBy().orElse(null),
+                    limits.offset(),
+                    limits.finalLimit(),
+                    qs.outputs()
+                );
+                subPlan.addProjection(topN, null, null, null);
+            }
+            return subPlan;
         }
+
     }
 
-    private static void maybeAddFilterProjection(QueriedSelectRelation relation, Plan plan) {
-        WhereClause whereClause = relation.querySpec().where();
+    private static Plan planFetch(FetchRewriter.FetchDescription fetchDescription, Planner.Context plannerContext, Plan subPlan) {
+        ReaderAllocations readerAllocations = plannerContext.buildReaderAllocations();
+        FetchPhase fetchPhase = new FetchPhase(
+            plannerContext.nextExecutionPhaseId(),
+            readerAllocations.nodeReaders().keySet(),
+            readerAllocations.bases(),
+            readerAllocations.tableIndices(),
+            fetchDescription.fetchRefs()
+        );
+        InputColumn fetchId = new InputColumn(0);
+        FetchSource fetchSource = new FetchSource(
+            fetchDescription.partitionedByColumns(),
+            Collections.singletonList(fetchId),
+            fetchDescription.fetchRefs()
+        );
+        FetchProjection fetchProjection = new FetchProjection(
+            fetchPhase.phaseId(),
+            plannerContext.fetchSize(),
+            ImmutableMap.of(fetchDescription.tableIdent(), fetchSource),
+            FetchRewriter.generateFetchOutputs(fetchDescription),
+            readerAllocations.nodeReaders(),
+            readerAllocations.indices(),
+            readerAllocations.indicesToIdents()
+        );
+        subPlan.addProjection(fetchProjection, null, null, null);
+        return new QueryThenFetch(subPlan, fetchPhase);
+    }
+
+    private static List<Symbol> extractQuerySymbols(QuerySpec qs) {
+        Optional<OrderBy> orderBy = qs.orderBy();
+        List<Symbol> querySymbols = new ArrayList<>();
+        if (orderBy.isPresent()) {
+            querySymbols.addAll(orderBy.get().orderBySymbols());
+        }
+        WhereClause where = qs.where();
+        if (where.hasQuery()) {
+            querySymbols.add(where.query());
+        }
+        return querySymbols;
+    }
+
+    private static void maybeAddFilterProjection(WhereClause whereClause, List<? extends Symbol> subRelationOutputs, Plan plan) {
         if (whereClause.hasQuery() || whereClause.noMatch()) {
-            FilterProjection filterProjection = ProjectionBuilder.filterProjection(relation.subRelation().fields(), whereClause);
+            FilterProjection filterProjection = ProjectionBuilder.filterProjection(subRelationOutputs, whereClause);
             plan.addProjection(filterProjection, null, null, null);
         }
     }

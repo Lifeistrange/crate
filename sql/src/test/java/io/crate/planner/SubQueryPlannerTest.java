@@ -23,6 +23,7 @@
 package io.crate.planner;
 
 import io.crate.planner.node.dql.Collect;
+import io.crate.planner.node.dql.PendingFetch;
 import io.crate.planner.node.dql.QueryThenFetch;
 import io.crate.planner.projection.*;
 import io.crate.test.integration.CrateDummyClusterServiceUnitTest;
@@ -50,13 +51,43 @@ public class SubQueryPlannerTest extends CrateDummyClusterServiceUnitTest {
     public void testNestedSimpleSelectUsesFetch() throws Exception {
         QueryThenFetch qtf = e.plan(
             "select x, i from (select x, i from t1 order by x asc limit 10) ti order by x desc limit 3");
-        Collect collect = (Collect) qtf.subPlan();
+        PendingFetch subPlan = (PendingFetch) qtf.subPlan();
+        Collect collect = (Collect) subPlan.subPlan();
         assertThat(collect.collectPhase().projections(), Matchers.contains(
             instanceOf(TopNProjection.class),
             instanceOf(TopNProjection.class),
-            // TODO: We can optimize this to delay fetch until after the OrderedTopNProjection
+            instanceOf(OrderedTopNProjection.class),
+            instanceOf(FetchProjection.class)
+        ));
+    }
+
+    @Test
+    public void testNestedSimpleSelectWithEarlyFetchBecauseOfWhereClause() throws Exception {
+        QueryThenFetch qtf = e.plan(
+            "select x, i from (select x, i from t1 order by x asc limit 10) ti where ti.i = 10 order by x desc limit 3");
+        PendingFetch subPlan = (PendingFetch) qtf.subPlan();
+        Collect collect = (Collect) subPlan.subPlan();
+        assertThat(collect.collectPhase().projections(), Matchers.contains(
+            instanceOf(TopNProjection.class),
+            instanceOf(TopNProjection.class),
+            instanceOf(OrderedTopNProjection.class),
             instanceOf(FetchProjection.class),
-            instanceOf(OrderedTopNProjection.class)
+            instanceOf(FilterProjection.class)
+        ));
+    }
+
+    @Test
+    public void testNestedSimpleSelectWithLateFetchWhereClauseMatchesQueryColumn() throws Exception {
+        QueryThenFetch qtf = e.plan(
+            "select x, i from (select x, i from t1 order by x asc limit 10) ti where ti.x = 10 order by x desc limit 3");
+        PendingFetch subPlan = (PendingFetch) qtf.subPlan();
+        Collect collect = (Collect) subPlan.subPlan();
+        assertThat(collect.collectPhase().projections(), Matchers.contains(
+            instanceOf(TopNProjection.class),
+            instanceOf(TopNProjection.class),
+            instanceOf(FilterProjection.class),
+            instanceOf(OrderedTopNProjection.class),
+            instanceOf(FetchProjection.class)
         ));
     }
 
@@ -66,7 +97,9 @@ public class SubQueryPlannerTest extends CrateDummyClusterServiceUnitTest {
                                     "   (select x, i from t1 order by x asc limit 10) ti " +
                                     "where ti.x = 10 " +
                                     "order by x desc limit 3");
-        List<Projection> projections = ((Collect) qtf.subPlan()).collectPhase().projections();
+        PendingFetch subPlan = (PendingFetch) qtf.subPlan();
+        Collect collect = (Collect) subPlan.subPlan();
+        List<Projection> projections = collect.collectPhase().projections();
         assertThat(projections, Matchers.hasItem(instanceOf(FilterProjection.class)));
     }
 }

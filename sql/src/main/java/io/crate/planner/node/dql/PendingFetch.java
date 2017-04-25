@@ -114,4 +114,8 @@ public class PendingFetch implements Plan, ResultDescription {
     public FetchRewriter.FetchDescription fetchDescription() {
         return fetchDescription;
     }
+
+    public Plan subPlan() {
+        return subPlan;
+    }
 }

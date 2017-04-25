@@ -34,17 +34,6 @@ public interface FetchDecider {
 
     FetchDecider NEVER = () -> false;
     FetchDecider ALWAYS = () -> true;
-    FetchDecider NO_FINALIZE = new FetchDecider() {
-        @Override
-        public boolean tryFetchRewrite() {
-            return true;
-        }
-
-        @Override
-        public boolean finalizeFetch() {
-            return false;
-        }
-    };
 
     /**
      * Verify if it makes sense to attempt doing a fetch-rewrite.
@@ -54,5 +43,23 @@ public interface FetchDecider {
 
     default boolean finalizeFetch() {
         return true;
+    }
+
+    final class Static implements FetchDecider {
+        private final boolean finalizeFetch;
+
+        public Static(boolean finalizeFetch) {
+            this.finalizeFetch = finalizeFetch;
+        }
+
+        @Override
+        public boolean tryFetchRewrite() {
+            return true;
+        }
+
+        @Override
+        public boolean finalizeFetch() {
+            return finalizeFetch;
+        }
     }
 }
